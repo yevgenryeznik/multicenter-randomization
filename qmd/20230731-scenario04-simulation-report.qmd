@@ -1,0 +1,1809 @@
+---
+title: "Simulations of the MTI stratified randomization"
+author: Yevgen Ryeznik
+date: today
+date-format: long
+format: 
+  html: 
+    html-math-method: katex
+    self-contained: true
+    self-contained-math: true
+    toc: true
+    toc-depth: 4
+    toc-location: right
+    toc-title: On this page
+    fig-align: center
+    fig-width: 8
+    fig-height: 6
+jupyter: julia-1.9  
+---
+
+# About
+
+The current document provides simulation scenarios and results of MTI stratified 
+randomization. 
+
+We use Monte Carlo simulations for a head-to-head comparison of 
+various randomization methods under different trial assumptions to provide some 
+recommendations on the choice of a randomization method that achieves "best" 
+performance in terms of balance and randomness criteria.
+
+The _**Poisson-Gamma model**_ is used to simulate patients' recruitment.
+
+Different measures of balance and randomness to quantify the statistical performance of various randomization designs are described as well.
+
+We use `Julia` programming language for simulations and visualization of the results.
+
+We'll be using the following packages to conduct the simulations.
+
+```{julia}
+#| label: loading-packages
+
+using CategoricalArrays
+using Colors
+using CSV
+using DataFrames
+using Distributions
+using LaTeXStrings 
+using Match
+using Pipe
+using Plots
+using Random
+using StatsPlots
+```
+
+
+# Modeling recruitment by _Poisson-Gamma model_.
+
+It is assumed that there is a _**multi-center study**_, recruiting $n$ patients from 
+$N$ centers in $G$ geographic regions.
+
+Each center activates at a random time $a_i$ ($i = 1, \ldots, N$) within an interval $[0, A]$: $a_i\sim Uniform(0, A)$, and we expect to complete the recruitment during the time period $[0, R]$, where both $A$ and $R$ are measured in months.
+
+The $i^\text{th}$ center ($i = 1, \ldots, N$) has its own recruitment rate $\lambda_i$, following Gamma distribution with _shape_ parameter $\alpha$ and _rate_ parameter $\beta$: $\lambda_i \sim \Gamma(\alpha, \beta)$. 
+
+Then, for a given center with a recruitment rate $\lambda_i$, patients' arrival times follow _**Poisson process**_ with a parameter $\lambda_i$.
+
+We have to define two data types, representing _**Poisson process**_ and _**Poisson-Gamma model**_ to implement the described _recruitment model_: `PoissonProcess` and `PoissonGammaModel`:
+
+```{julia}
+#| label: data-types-for-recruitment-model
+#| lst-label: lst-data-types-for-recruitment-model
+#| lst-cap: Data types used to simulate the recruitment _Poisson-Gamma model_.
+ 
+# Defining Poisson process
+struct PoissonProcess <: Sampleable{Univariate, Continuous}
+    λ::Number
+end
+
+
+# Defining Poisson-Gamma model
+struct PoissonGammaModel <: Sampleable{Univariate, Continuous}
+    α::Number   # shape parameter of Gamma distribution (α > 0)   
+    β::Number   # rate parameter of Gamma distribution (β > 0)  
+end
+```
+
+Also, we define functions to sample from the recruitment model to simulate patients' recruitment times:
+
+```{julia}
+#| label: sampling-fcn-for-recruitment-model
+#| lst-label: lst-sampling-fcn-for-recruitment-model
+#| lst-cap: Functions used to sample from the _Poisson-Gamma model_.
+
+# Function samples from the Poisson process (overriding Base.rand() function) 
+function Base.rand(pp::PoissonProcess, n::Int64)
+    λ = pp.λ
+    u = rand(Uniform(), n)
+    y = [-log(1-u[i])/λ for i in eachindex(u)]
+
+    return cumsum(y)
+end
+
+
+# Function samples from the Poisson-Gamma model (overriding Base.rand() function) 
+function Base.rand(pgm::PoissonGammaModel, n::Int64)
+    # extracting model parameters
+    α = pgm.α   # shape parameter      
+    β = pgm.β   # rate parameter
+    θ = 1 / β   # scale parameter
+
+    # rate λ ~ Gamma(α, β), where α is a scale and β is a rate. 
+    # However, in Julia, Gamma distribution is parametrized 
+    #   in terms of shape (α) and scale (θ = 1/β).
+    # So, we call defined Gamma distribution as Gamma(α, 1/β).
+    λ = rand(Gamma(α, θ))
+    
+    # returning event times generated from a Poisson process with paramter λ
+    return rand(PoissonProcess(λ), n)
+end
+```
+
+# Modeling multi-center trial
+
+We create a new data type to deal with _**multi-center trial**_. A trial is described by the _number of patients_ involved in the study, a set of _centers_ together with corresponding _regions_, a _recruitment model_ (_**Poisson-Gamma model**_), centers' _activation times_, $a_i\sim Uniform(0, A)$, and expected/assumed _recruitment duration_ $R$.
+
+The following code defines a new data type `MultiCenterTrial` used for simulations:
+
+```{julia}
+#| label: mct-data-type
+#| lst-label: lst-mct-data-type
+#| lst-cap: Data type used to represent a _multi-center trial_.
+ 
+# Defining multi-center trial
+struct MultiCenterTrial
+    nsbj::Int64                           # number of subjects in a trial
+    center::Vector{Int64}                 # centers' IDs
+    region::Vector{Int64}                 # regions' IDs
+    recruitment_model::PoissonGammaModel  # recruitment model
+    A::Union{Number, Nothing}             # [0, A] represents activation time window 
+                                          #  a ~ Uniform(0, A) is a center's opening time
+    R::Union{Number, Nothing}             # [0, R] represents the recruitment period            
+end
+
+
+# Overriding a `Base` function `show` to print out an instance of `MultiCenterTrial`
+function Base.show(io::IO, mct::MultiCenterTrial)
+    α = round(mct.recruitment_model.α, digits = 2)
+    β = round(mct.recruitment_model.β, digits = 2)
+    
+    println("Multi-cente trial:")
+    println("   - $(mct.nsbj) subject.")
+    println("   - $(length(mct.center)) centers.")
+    println("   - $(length(unique(mct.region))) regions.")
+    println("   - recrutiment model: Poisson-Gamma with α=$α (shape) and β=$β (rate) parameters.")
+    if !isnothing(mct.A)
+        println("   - centers' activation period: $(mct.A) (months).")
+    end
+    if !isnothing(mct.R)
+        println("   - recruitment period: $(mct.R) (months).")
+    end
+end
+```
+
+Now, let us define a function that simulates a _**recruitment process**_ for a _**multi-center trial**_:
+
+```{julia}
+#| label: recruit-fcn
+#| lst-label: lst-recruit-fcn
+#| lst-cap: Function used to simulate recruitment in a multi-center trial according to Poisson-Gamma model.
+
+# Function simulates recruitment according to the Poisson-Gamma model
+function recruit(mct::MultiCenterTrial)
+    # sample size
+    nsbj = mct.nsbj
+    
+    # centers/regions/number of centers
+    center = mct.center
+    region = mct.region
+    ncnt = length(center)
+
+    # recruitment model (Poisson-Gamma)
+    recruitment_model = mct.recruitment_model
+    
+    # [0, A] represents time window within which centers are activated. 
+    A = mct.A      
+ 
+    # [0, R] represents recruitment period. 
+    R = mct.R     
+
+    # center activation period (in days)
+    AP = !isnothing(A) ? round(Int, A*365.25/12) : 0
+
+    # centers' activation times
+    at = AP == 0 ? repeat([0], ncnt) : round.(Int, rand(Uniform(0, AP), ncnt))
+    
+    # recruitment period (in days)
+    RP = !isnothing(R) ? round(R*365.25/12) : nothing
+
+    # simulating recruitment
+    output = vcat(map(eachindex(center)) do i 
+        # enrollment time (in days)
+        et = round.(Int, 1 .+ at[i] .+ rand(recruitment_model, nsbj))
+        return DataFrame(activation_time = at[i], enrollment_time = et, center = center[i])
+    end...)
+
+    if !isnothing(RP)
+        filter!(:enrollment_time => t -> t <= RP, output)
+    end
+    
+    DataFrames.sort!(output, [:enrollment_time, :center], alg = QuickSort)
+    n = min(nrow(output), nsbj)
+    
+    # taking first n observations
+    output = first(output, n)
+   
+    # adding corresponding regions
+    output = innerjoin(
+        output, 
+        DataFrame(center = center, region = region), 
+        on = :center
+    )
+
+    # adding subjects' IDs
+    insertcols!(output, 1, :sbj => 1:n)
+
+    # return
+    return output
+end
+```
+
+
+# Randomization
+
+In our simulation study, we compare several randomization procedure, targeting $1:1$ allocation. The following randomization procedures (designs) have been included in the simulation:
+
+- Completely randomized design (_**CRD**_).
+- Permuted block design (_**PBD**_).
+- Block urn design (_**BUD**_).
+- Big stick design (_**BSD**_).
+- Ehrenfest urn design (_**EUD**_).
+- Dynamic balancing randomization (_**DBR**_).
+
+First, we create several data types to deal with the considered randomization designs:
+
+```{julia}
+#| label: rnd-data-types
+#| lst-label: lst-rnd-data-types
+#| lst-cap: Data types to deal with different randomization designs.
+
+# An exception type to indicate issues while initiating/dealing with a randomization procedure. 
+struct RandomizationException <: Exception
+    message::String
+end
+
+# Function throws an error related to randomization issue.
+Base.showerror(io::IO, e::RandomizationException) = print(io, e.message, "!")
+
+# defining exceptions
+ParameterIsLessThanTwo() = RandomizationException("A parametr of the procedure (`mti`) is less than 2")
+
+
+# Completele Randomizid Design (CRD)
+struct CRD
+
+end
+
+# Permuted Block Design (PBD)
+struct PBD
+    param::Int64
+end
+
+
+# Block Urn Design (BUD)
+struct BUD 
+    param::Int64
+end
+
+
+# Big Stick Design (BSD)
+struct BSD
+    param::Int64
+end
+
+
+# Ehrenfest Urn Design (EUD)
+struct EUD
+    param::Int64
+
+    function EUD(param::Int64)
+        if param < 2  
+            throw(ParameterIsLessThanTwo())
+        else
+            return new(param)
+        end
+    end
+end
+
+
+# Dynamic balancing randomization (DBR) 
+struct DBR
+    param1::Int64
+    param2::Int64
+    param3::Int64
+end
+
+
+# ================= Utility functions =================
+# function to label CRD
+function label(rnd::CRD)
+    return "CRD"
+end
+
+
+# function to label DBR
+function label(rnd::DBR)
+    param = rnd.param1, rnd.param2, rnd.param3
+    return "DBR($(param[1]), $(param[2]), $(param[3]))"
+end
+
+
+# function to label PBD, BUD, BSD, EUD
+function label(rnd::Union{PBD, BUD, BSD, EUD})
+    design = typeof(rnd).name.wrapper
+    param = rnd.param
+
+    return "$design($param)"
+end
+```
+
+Then, we define randomization procedures as follows:
+
+_at every allocation step $j$ ($j = 1, \ldots, n$), treatment assignment $\delta_j = 1\text{ or }0$ is made with a probability $\phi_j$, where probability $\phi_j$ is conditional on the current treatment imbalnce within a stratum: trial/region/center level_:
+
+$$
+\begin{aligned}
+    \phi_1 &= \Pr(\delta_1 = 1) = 0.5, \\
+    \phi_j &= \Pr(\delta_j = 1|D_{j-1}) = f(D_{j-1}), \: j = 2, \ldots, n.
+\end{aligned}
+$$
+
+where $\delta_j = 1$ indicates that the $j^\text{th}$ subject is allocated to the _experimental_ ($E$) tretament, and $\delta_j = 1$ indicates that allocation is made to the _control_ ($C$) treatment.
+
+The value of $\phi_j$ can be calculated as a value of the _**allocation function**_ $f(D_{j-1})$.
+
+Now, let us define _**allocation functions**_ for our randomization designs.
+
+## Allocation function for CRD
+
+For the CRD, the allocation function is a _constant_:
+
+$$
+\phi_j = 0.5, \: \forall j = 1, \ldots, n.
+$$
+
+## Allocation function for PBD
+
+With PBD, treatment assignments are made at random in blocks of size $2b$ (exactly $b$ assignments to each treatment $E$ and $C$ in each block).
+
+The allocation function is defined as
+
+$$
+\phi_j = f(D_{j-1}) = 0.5\left(1-\frac{D_{j-1}}{2b+2b\lfloor\frac{j-1}{2b}\rfloor -(j-1)}\right).
+$$
+
+`Julia` implementation is given by the following code:
+
+```{julia}
+#| label: pbd-allocation-function
+#| lst-label: lst-pbd-allocation-function
+#| lst-cap: Allocation function of the PBD.
+
+function allocation_fcn(rnd::PBD, N1::Int64, N2::Int64)
+    # getting a block size: bs = 2*b, where b = rnd.param
+    bs = 2*rnd.param
+
+    # indicating a current allocation step (current subject's ID)
+    j = N1 + N2 + 1
+
+    # calculating current imbalance
+    D = N1 - N2
+
+    # allocation function value (probability of treatment assignment)
+    f = 0.5*(1 - D/(bs + bs*floor((j-1)/bs) - (j-1)))
+
+    # returning allocation function value
+    return f
+end
+```
+
+## Allocation function for BUD
+
+BUD is based on the _**urn model**_. Let us consider two urns: _active_ and _inactive_. Initially, the active urn contains $2b$ balls ($b$ balls of each type $E$ or $C$), and the inactive urn is empty. 
+
+For a given subject, a ball is drawn at random from the active urn. 
+
+If type $k$ ball is drawn ($k=E$ or $k=C$), then treatment $k$ is assigned and the ball is placed in the inactive urn. 
+
+The procedure is repeated until one type $E$ ball and one type $C$ ball appear in the inactive urn, in which case these two balls are placed into the active urn. The described steps are repeated for the next subject. 
+
+The allocation function is defined as
+
+$$
+\phi_j = f(D_{j-1}) = 0.5\left(1-\frac{D_{j-1}}{2b-|D_{j-1}|}\right).
+$$
+
+`Julia` implementation is given by the following code:
+
+```{julia}
+#| label: bud-allocation-function .
+#| lst-label: lst-bud-allocation-function
+#| lst-cap: Allocation function of the BUD.
+
+# Allocation function for BUD randomization procedure
+function allocation_fcn(rnd::BUD, N1::Int64, N2::Int64)
+    # BUD's MTI parameter
+    mti = rnd.param
+
+    # calculating current imbalance
+    D = N1 - N2
+
+    # allocation function value (probability of treatment assignment)
+    f = 0.5*(1-D/(2*mti - abs(D)))
+
+    # returning allocation function value
+    return f
+end
+```
+
+## Allocation function for BSD
+
+Every subject is randomized to treatment $E$ or $C$ with probability $0.5$ as long as treatment imbalance is less than $b>0$; if $|D(j-1)|=b$, the next allocation is made deterministically to the underrepresented treatment to restore near-balance within acceptable limits.
+
+The allocation function is defined as
+
+$$
+\phi_j = f(D_{j-1}) = 0.5\left(1-\text{sign}{(D_{j-1})}\left\lfloor\frac{|D_{j-1}|}{b}\right\rfloor\right).
+$$
+
+`Julia` implementation is given by the following code:
+
+```{julia}
+#| label: bsd-allocation-function .
+#| lst-label: lst-bsd-allocation-function
+#| lst-cap: Allocation function of the BSD.
+
+# Allocation function for BUD randomization procedure
+function allocation_fcn(rnd::BSD, N1::Int64, N2::Int64)
+    # BSD's parameter
+    mti = rnd.param
+
+    # calculating current imbalance
+    D = N1 - N2
+
+    # allocation function value (probability of treatment assignment)
+    f = 0.5*(1-sign(D)*floor(abs(D)/mti))
+
+    # returning allocation function value
+    return f
+end
+```
+
+
+## Allocation function for EUD
+
+EUD is based on the _**urn model**_. Let us consider two urns representing treatment groups $E$ and $C$. There are $2b$ balls, initially equally distributed between the urns. 
+
+For a given subject, a ball is drawn at random from the pool of $2b$ balls. The selection of a ball from urn $k$ corresponds to the assignment of treatment $k=E$ or $k=C$. The chosen ball is then replaced into the opposite urn. 
+
+The described steps are repeated for the next subject.
+
+The allocation function is defined as
+
+$$
+\phi_j = f(D_{j-1}) = 0.5\left(1-\frac{D_{j-1}}{b}\right).
+$$
+
+`Julia` implementation is given by the following code:
+
+```{julia}
+#| label: eud-allocation-function
+#| lst-label: lst-eud-allocation-function
+#| lst-cap: Allocation function of the EUD.
+
+# Allocation function for BUD randomization procedure
+function allocation_fcn(rnd::EUD, N1::Int64, N2::Int64)
+    # EUD's parameter
+    mti = rnd.param
+
+    # calculating current imbalance
+    D = N1 - N2
+
+    # allocation function value (probability of treatment assignment)
+    f = 0.5 * (1 - D/mti)
+
+    # returning allocation function value
+    return f
+end
+```    
+
+## Allocation function for DBR
+
+DBR is a _**covariate-adaptive randomization**_ method. It attempts to sequentially balance treatment assignments according to a pre-specified hierarchy of classification factors. 
+
+With DBR, it is not possible to pre-generate the randomization list, and so it is created dynamically, taking into account the pattern of recruitment in different study centers/regions. 
+
+Let $b_1$, $b_2$, $b_3$ be some pre-specified positive integers that define the "acceptable" limits for treatment imbalance at the _center_, _region_, and _trial_ level. Consider a point in the trial when $j-1$ patients have been randomized, and based on the data, we have the values of imbalances at the 
+
+- center level: $D_{i, j-1}$ ($i = 1, \ldots, N$); 
+- region level: $\widetilde{D}_{g, j-1}$ ($g = 1,\ldots ,G$); 
+- trial level: $D_{j-1}$. 
+
+Suppose the $j^\text{th}$ patient is recruited at the $i^\text{th}$ center within the $g^\text{th}$ geographic region. Then, the DBR algorithm to determine the treatment assignment for the $j^\text{th}$ patient involves the following steps:
+
+**Step 1** (balance at the center level): If $|D_{i, j-1}|\geq b_1$, then choose the treatment assignment deterministically, to reduce imbalance within this center; otherwise go to **Step 2**.
+
+
+**Step 2** (balance at the region level): If $|\widetilde{D}_{g, j-1}| \geq b_2$, then choose the treatment assignment deterministically, to reduce imbalance within this region; otherwise go to **Step 3**.
+
+**Step 3** (balance at the trial level): If $|D_{j-1}|\geq b_3$, then choose the treatment assignment deterministically, to reduce imbalance at the trial level; otherwise go to **Step 4**.
+
+**Step 4**: Allocate a treatment at random: $\phi_j=0.5$. 
+
+`Julia` implementation is given by the following code:
+
+```{julia}
+#| label: dbr-allocation-function
+#| lst-label: lst-dbr-allocation-function
+#| lst-cap: Allocation function of the DBR.
+
+# Allocation function for DBR randomization procedure
+function allocation_fcn(rnd::DBR, Dc::Int64, Dr::Int64, Dt::Int64)
+    b1 = rnd.param1
+    b2 = rnd.param2
+    b3 = rnd.param3
+
+    # allocation function value (probability of treatment assignment)
+    if abs(Dc) == b1
+        f = Dc < 0 ? 1 : 0
+    elseif abs(Dr) >= b2
+        f = Dr < 0 ? 1 : 0
+    elseif abs(Dt) >= b3
+        f = Dt < 0 ? 1 : 0
+    else 
+        f = 0.5    
+    end 
+
+    # returning allocation function value
+    return f
+end
+```
+
+## Simulating randomization for selected randomization designs
+
+Now, we can write functions, simulating selected randomization designs.
+
+The input parameter(s) is (are) the following:
+
+- `recruitment` is a `DataFrame` with recruitment information -- an output of the `recruit()` function (defined above).
+- `rnd` represents a randomization design.
+- `stratify_by` represents stratification factor and accepts three possible values: `nothing` (no stratification), `:region` (stratification by _region_), `:center` (stratification by _center_).
+
+```{julia}
+#| label: randomization-functions
+#| lst-label: lst-randomization-functions
+#| lst-cap: Functions used to simulate randomization.
+
+# ====================== Randomization functions ======================
+
+# Function simulates CRD
+function randomize(recruitment::DataFrame)
+    nsbj = nrow(recruitment)               # getting number of subjects
+    trt = Int.(rand(Bernoulli(), nsbj))    # treatment assignments
+    prb = repeat([0.5], nsbj)              # allocation probabilities
+
+    return trt, prb
+end
+
+
+# Function simulates MTI procedures (PBD, BUD, BSD, EUD)
+function randomize(
+    recruitment::DataFrame, 
+    rnd::Union{PBD, BUD, BSD, EUD}, 
+    stratify_by::Union{Nothing, Symbol}
+)
+    nsbj = nrow(recruitment)                 # getting number of subjects
+    if isnothing(stratify_by)                # if no stratification
+        strata = ones(Int64, nsbj) 
+    else                                     # startify by center or region
+        strata = recruitment[!, stratify_by] 
+    end 
+    prb = Float64[]                          # array to collect allocation probabilities
+    trt = Int64[]                            # array to collect tretament assignments
+    for j in 1:nsbj
+        idx = strata[1:j-1] .== strata[j]
+        N1 = sum(idx) == 0 ? 0 : sum(trt[idx])
+        N2 = sum(idx) == 0 ? 0 : length(trt[idx]) - N1
+
+        ϕ = allocation_fcn(rnd, N1, N2)
+        δ = Int(rand(Bernoulli(ϕ)))[1]
+
+        push!(prb, ϕ)
+        push!(trt, δ)
+    end
+
+    return trt, prb
+end
+
+
+# Function simulates DBR
+function randomize(recruitment::DataFrame, rnd::DBR)
+    nsbj = nrow(recruitment)      # getting number of subjects
+
+    cnt = recruitment[!, :center] # startification factor = center
+    reg = recruitment[!, :region] # startification factor = region
+    tri = ones(Int64, nsbj)       # no startification 
+
+    prb = Float64[]               # array to collect allocation probabilities
+    trt = Int64[]                 # array to collect tretament assignments
+    for j in 1:nsbj
+        idxc = cnt[1:j-1] .== cnt[j]
+        N1c = sum(idxc) == 0 ? 0 : sum(trt[idxc])
+        N2c = sum(idxc) == 0 ? 0 : length(trt[idxc]) - N1c
+
+        idxr = reg[1:j-1] .== reg[j]
+        N1r = sum(idxr) == 0 ? 0 : sum(trt[idxr])
+        N2r = sum(idxr) == 0 ? 0 : length(trt[idxr]) - N1r
+
+        idxt = tri[1:j-1] .== tri[j]
+        N1t = sum(idxt) == 0 ? 0 : sum(trt[idxt])
+        N2t = sum(idxt) == 0 ? 0 : length(trt[idxt]) - N1t
+
+        ϕ = allocation_fcn(rnd, N1c-N2c, N1r-N2r, N1t-N2t)
+        δ = Int(rand(Bernoulli(ϕ)))[1]
+
+        push!(prb, ϕ)
+        push!(trt, δ)
+    end
+
+    return trt, prb
+end
+```
+
+Finally, let us write simulation functions to simulate different randomization by calling our `randomize()` function:
+
+```{julia}
+#| label: simulation-functions
+#| lst-label: lst-simulation-functions
+#| lst-cap: Functions used to simulate selected randomization designs.
+
+# ===================== Simulation functions ==========================
+# Function simulates CRD
+function simulate(recruitment::DataFrame)
+
+    # simulating randomization procedure
+    trt, prb = randomize(recruitment) 
+
+    # collecting simulated data
+    output = hcat(
+        recruitment,
+        DataFrame(
+            design = "CRD",
+            trt = trt, prb = prb
+        )
+    )
+
+    insertcols!(
+        output, 
+        :enrollment_time, 
+        :nothing => ones(Int64, nrow(output)), 
+        after = true
+    )
+
+    return output
+end
+
+
+# Function simulates PBD, BUD, BSD, EUD
+function simulate(recruitment::DataFrame, rnd::Union{PBD, BUD, BSD, EUD})
+    # simulating stratified randomization
+    trt_n, prb_n = randomize(recruitment, rnd, nothing) # no stratification
+    trt_c, prb_c = randomize(recruitment, rnd, :center) # stratify by center
+    trt_r, prb_r = randomize(recruitment, rnd, :region) # stratify by region
+
+    # collecting simulated data
+    output = hcat(
+        recruitment,
+        DataFrame(
+            design = label(rnd),
+            trt_n = trt_n, prb_n = prb_n, 
+            trt_c = trt_c, prb_c = prb_c, 
+            trt_r = trt_r, prb_r = prb_r            
+        )
+    )
+    
+    insertcols!(
+        output, 
+        :enrollment_time, 
+        :nothing => ones(Int64, nrow(output)), 
+        after = true
+    )
+
+    return output
+end
+
+
+# Function simulates DBR 
+function simulate(recruitment::DataFrame, rnd::DBR)
+
+    # simulating randomization procedure
+    trt, prb = randomize(recruitment, rnd) 
+
+    # collecting simulated data
+    output = hcat(
+        recruitment,
+        DataFrame(
+            design = label(rnd),
+            trt = trt, prb = prb 
+        ) 
+    )
+
+    insertcols!(
+        output, 
+        :enrollment_time, 
+        :nothing => ones(Int64, nrow(output)), 
+        after = true
+    )
+
+    return output
+end
+```
+
+# Simulation
+
+We apply Monte Carlo simulation to compare several randomization strategies with respect to balance and randomness for a multi-center $1:1$ randomized clinical trial (RCT) with _**stochastic recruitment model**_ (_**Poisson-Gamma model**_). 
+
+The following parameters will be used:
+
+- Target recruitment period $R=12$ (months).
+- Centers' activation times, $a_i \sim Uniform(0, 4)$, $i = 1, \ldots, N$, i.e., $A = 4$ (months) -- all centers are activated during the first 4-month period.
+- $n=500$ patients.
+- $N=80$ centers.
+- $G=5$ regions (such that there are 16 centers per region).
+- $\alpha=1.2$ and $\beta=58$ (the assumed mean rate is $\alpha/\beta\approx 0.021$ patients per site per day).
+
+We consider four approaches to randomization: 
+
+I) unstratified; 
+II) center-stratified; 
+III) region-stratified; 
+IV) dynamic balancing randomization (DBR). 
+
+For approaches I–III, four different methods to generate a randomization sequence are considered: 
+
+- permuted block design (PBD); 
+- block urn design (BUD);
+- big stick design (BSD); 
+- Ehrenfest urn design (EUD). 
+
+These designs involve the positive integer parameter $b$ (MTI threshold or _half-block size_ for PBD), and they ensure that the absolute value of imbalance at the chosen level (trial, region, or center) is capped by $b$. 
+
+For approach IV, there are 3 MTI parameters: 
+
+- $b_1$ (for the center level), 
+- $b_2$ (for the region level), 
+- $b_3$ (for the trial level). 
+
+Overall, 16 randomization methods will be compared:
+
+- Unstratified PBD(b=2)
+- Unstratified BUD(b=2)
+- Unstratified EUD(b=2)
+- Unstratified BSD(b=2)
+- Region-stratified PBD(b=2)
+- Region-stratified BUD(b=2)
+- Region-stratified EUD(b=2)
+- Region-stratified BSD(b=2)
+- Center-stratified PBD(b=2)
+- Center-stratified BUD(b=2)
+- Center-stratified EUD(b=2)
+- Center-stratified BSD(b=2)
+- DBR with $b_C=2$, $b_R=2$, $b_T=2$
+- DBR with $b_C=2$, $b_R=4$, $b_T=4$
+- DBR with $b_C=2$, $b_R=4$, $b_T=8$
+- Simple randomization (CRD)
+
+## Setting up the simulation parameters
+
+```{julia}
+#| label: simulation-setup
+#| lst-label: lst-simulation-setup
+#| lst-cap: Setup of the simulation parameters. 
+
+# ======================= Simulation setup ============================
+scenario = 4;
+
+# number of subjects
+n = 500;
+
+# number of centers used in simulations
+N = 80;
+
+# centers' IDs
+center = collect(1:N);
+
+# number of regions used in simulations
+G = 5;
+
+# number of centers per region
+N_per_G = Int(N/G);
+
+# regions' IDs
+region = repeat(1:G, inner = N_per_G);
+
+# a period of the center activation (in months)
+A = 4;
+
+# recruitment period (in months)
+R = 12;
+
+# total enrollment period (in days)
+EP = round(R*365.25/12) 
+ 
+# centers' activation period (in days)
+AP = round(A*365.25/12) 
+
+# mean enrollment rate per site per day
+m = n/((EP - AP/2)*N) 
+
+# recruitment (Poisson-Gamma) model
+α = 1.2
+β = α/m 
+recruitment_model = PoissonGammaModel(α, β)
+
+# initializing MCT:
+# recruitment period R is set to `nothing`, i.e., 
+#    we stop recruitment when all subjects are enrolled
+mct = MultiCenterTrial(n, center, region, recruitment_model, A, nothing);
+
+# number of simulation runs
+S = 10000
+
+# MTI randomization procedures used in simulations
+b = 4;
+mti_rnd = [PBD(b), BUD(b), EUD(b), BSD(b)];
+
+# DBR procedures used in simulations
+dbr_rnd = [DBR(b, b, b), DBR(b, 2*b, 2*b), DBR(b, 2*b, 4*b)];
+
+# CRD 
+crd_rnd = CRD();
+
+# setting random seed (for reproducibility)
+seed = 3141592;
+Random.seed!(seed);
+
+# looking at `MultiCenterTrial` obect
+mct
+```
+
+## Simulating recruitment
+
+```{julia}
+#| label: simulating-recruitment
+#| lst-label: lst-simulating-recruitment
+#| lst-cap: Simulating recruitment for a given multi-center trial structure and number of simulations (S).
+
+# simulating recruitment, given `MultiCenterTrial` structure
+@time recruitment = [recruit(mct) for _ in 1:S];
+```
+
+Let's take a look at one simulation output:
+
+```{julia}
+#| label: tbl-recruitment-simulation-output
+#| tbl-cap: First 10 patients' enrollments in one simulation.
+#| tbl-colwidths: [2, 2, 2, 2, 2, 2]
+
+first(recruitment[1], 10)
+```
+
+## Simulating randomization
+
+Now, given simulated recruitment, we can simulate considered randomization designs.
+
+```{julia}
+#| label: simulating-randomization
+#| lst-label: lst-simulating-randomization
+#| lst-cap: Simulating randimization, given simulated recruitment.
+
+# simulating 4 MTI randomization procedures
+@time simulated_mti = vcat(map(eachindex(recruitment)) do s
+    output = vcat(map(mti_rnd) do rnd
+        simulate(recruitment[s], rnd)
+    end...)
+    insertcols!(output, :design, :sim => s)
+end...);
+
+
+# simulating 3 DBR procedures
+@time simulated_dbr = vcat(map(eachindex(recruitment)) do s
+    output = vcat(map(dbr_rnd) do rnd
+        simulate(recruitment[s], rnd)
+    end...)
+    insertcols!(output, :design, :sim => s)
+end...);
+
+
+# simulating CRD
+@time simulated_crd = vcat(map(eachindex(recruitment)) do s
+    output = simulate(recruitment[s])
+    insertcols!(output, :design, :sim => s)
+end...);
+```
+
+## Summarazing simulations results/operating characteristics
+
+First, let us define some helper functionality.
+
+```{julia}
+#| label: helper-functionality
+
+# data type, defining an exception when a function input parameter doen't match
+struct MatchException <: Exception
+    message::String
+end
+
+# Function throws an error related to randomization setup.
+Base.showerror(io::IO, e::MatchException) = print(io, e.message, "!")
+
+# defining exceptions
+InappropriateParameterValue() = MatchException("An input parameter `rnd_type` value must be one of [\"MTI\", \"DBR\", \"CRD\"]")
+
+# function used to categorize (factorize) variable
+function categorize(variable)
+    cv = categorical(variable, ordered = true)
+    levels!(cv, unique(variable))
+
+    return cv
+end
+
+function categorize(variable, _levels, _labels)
+    cv = categorical(variable, levels = _levels, ordered = true)
+    
+    for (_level, _label) in zip(_levels, _labels)
+        recode!(cv, _level => _label)
+    end
+
+    return cv
+end
+
+# collecting simulated output
+simulated_output = [simulated_mti, simulated_dbr, simulated_crd];
+rnd_type = ["MTI", "DBR", "CRD"];
+```
+
+### Time-to-complete recruitment
+
+Here, we plot a histogram of the time-to-complete recruitment -- the time, when the last patient (500-th in our simulations) has been recruited.
+
+```{julia}
+#| label: fig-time-to-complete-recruitment
+#| fig-cap: Histogram of the time-to-complete recruitment.
+
+# time to complete recruitment
+ttr = [maximum(recruitment[s].enrollment_time) for s in eachindex(recruitment)];
+time_to_complete_recr = DataFrame(ttr = ttr);
+
+# setting file name to save the output
+ttr_file = "./output/scenario0$(scenario)/output00-time-to-complete-recr";
+
+# saving data
+CSV.write(ttr_file * ".csv", time_to_complete_recr); 
+
+# visualizing simulated data
+ttr_histogram = @df time_to_complete_recr histogram(
+    :ttr,
+    bins = range(250, 550, step = 5), 
+    color = :blue4,
+    alpha = 0.5,
+    label = "",
+    xlab = "Time to complete recruitment (days)",
+    ylab = "Frequency",
+    ylims = (0, 650),
+    yticks = ((0:100:600)),
+    tickfontsize = 10,
+    labelfontsize = 12,
+    size = (800, 600),
+    dpi = 300
+);
+
+# saving plot
+png(ttr_histogram, ttr_file);
+
+# show plot
+ttr_histogram
+```
+
+### Number of centers recruited exactly $k$ patients ($k = 1, 2, \ldots, n$)
+
+Here, we are summarize the expected number of centers recruited a pre-specified number of patients. 
+
+```{julia}
+#| label: fig-centers-with-k-patients
+#| fig-cap: Bar plot of the expected number of centers recruited $k$ patients.
+
+# number of centers, recruited k subjects (k = 1, ..., n)
+#    we need two helper functions to replace missing values in an array
+replace_missing1(array) = [ismissing(a) ? 0 : a for a in array];
+replace_missing2(array) = [ismissing(a) ? 0 : 1 for a in array];
+
+@time centers_with_k_subjects = vcat(map(eachindex(recruitment)) do s
+    output = @pipe recruitment[s] |>
+        groupby(_, :center) |> 
+        combine(_, :sbj => length => :k) |>
+        rightjoin(_, DataFrame(center = 1:N), on = :center) |>
+        transform(_, :k => replace_missing1 => :k) |>
+        rightjoin(_, DataFrame(k = 0:n), on = :k) |>
+        transform(_, :center => replace_missing2 => :center) |>
+        groupby(_, :k) |>
+        combine(_, :center => sum => :ncnt)
+    
+    insertcols!(output, :k, :sim => s)
+end...);
+
+# setting file name to save the output
+expected_ncnt_file = "./output/scenario0$(scenario)/output01-centers-with-k-subjects";
+
+# saving data
+CSV.write(expected_ncnt_file * ".csv", centers_with_k_subjects)
+
+# visualizing simulated data
+expected_ncnt_barplot = @df (@pipe centers_with_k_subjects |>
+    groupby(_, :k) |>
+    combine(_, :ncnt => mean => :expected_ncnt) |>
+    filter(:expected_ncnt => (x -> x .> 0.01), _)
+) bar(
+    :expected_ncnt,
+    bar_width = 1,
+    color = :blue4,
+    alpha = 0.5,
+    label = "",
+    xlab = L"Number of subjects recruited in a center ($k$)",
+    ylab = latexstring("Expected number of centers that \n recruited exactly \$k\$ subjects"),
+    xticks = ((1:5:45), (0:5:40)),
+    ylims = (0, 10),
+    yticks = ((1:9)),
+    tickfontsize = 10,
+    labelfontsize = 12,
+    size = (800, 600),
+    dpi = 300
+);    
+
+# saving plot
+png(expected_ncnt_barplot, expected_ncnt_file);
+
+# show plot
+expected_ncnt_barplot
+```
+
+### Balance
+
+The final imbalance is defined as
+$$
+D(n) = n_E - n_C,
+$$
+
+where $n_C$ and $n_C$ are numbers of patients allocated to the _experimental_ ($E$) and _control_ ($C$) tretament respectively. 
+
+One of the measures of imbalance we are interested in is _**loss**_ defined as
+
+$$
+\begin{aligned}
+L_1 &= \frac{|D(n)|^2}{n}\: \text{(if there is no stratification)} \\
+L_2 &= \sum\limits_{i=1}^{N}\frac{|D(n_i)|^2}{n_i}\: \text{(if there is stratification by center)} \\
+L_3 &= \sum\limits_{g=1}^{G}\frac{|D(n_g)|^2}{n_g}\: \text{(if there is stratification by region)} \\
+\end{aligned}
+$$
+
+Loss is a random variable whose distribution is determined by the randomization procedure used in the study.
+
+We can also consider estimation efficiency of a particular randomization design with relative to the "idealized" balanced design for which loss is zer. Then, we have 
+
+$$
+RE = 1-\frac{L}{n},
+$$
+
+where $L$ takes one of the forms $L_1$, $L_2$, and $L_3$. $RE$ is a random variable taking values in the range 0–1 whose probability distribution can be evaluated using Monte Carlo simulations. 
+
+```{julia}
+#| label: summarizing-imbalance-01-loss
+
+# function calculates imbalance, given a sequence of treatment assignments
+function abs_imb_fcn(trt)
+    nsbj = length(trt)         # sample size
+    imb = 2*sum(trt) - nsbj    # final imbalance
+
+    return abs(imb)            # absolute imbalance
+end
+
+# function calculates loss, given a sequence of treatment assignments
+function loss_fcn(trt)
+    nsbj = length(trt)         # sample size
+    imb = 2*sum(trt) - nsbj    # final imbalance
+
+    return abs(imb)^2/nsbj     # loss
+end
+
+# function calculates |imbalance|, given a sequence of treatment assignments
+function imb_fcn(trt)
+    nsbj = length(trt)         # sample size
+    imb = 2*sum(trt) - nsbj    # final imbalance
+
+    return abs(imb)            # absolute imbalance
+end
+
+
+# function calculates loss over simulations
+function calculate_abs_imb(simulated_output::DataFrame, rnd_type::String)
+    if rnd_type == "MTI"
+        vcat(map([:nothing, :center, :region]) do stratified_by 
+            trt_var = @match stratified_by begin
+                :nothing => :trt_n
+                :center  => :trt_c
+                :region  => :trt_r
+            end
+    
+            design_prefix = @match stratified_by begin
+                :nothing => "U-"
+                :center  => "C-"
+                :region  => "R-"
+            end
+    
+            vcat(map([:nothing, :center, :region]) do stratified_by 
+                output = @pipe simulated_output |> 
+                    groupby(_, [:sim, :design]) |>
+                    combine(_, trt_var => abs_imb_fcn => :imb)
+
+                insertcols!(
+                    output, 
+                    :imb, 
+                    :stratified_by => string(stratified_by),
+                    :nsbj => n, 
+                    after=true
+                )
+
+                transform!(
+                    output, 
+                    :design => (design -> design_prefix .* design) => :design
+                )
+            end...)
+        end...)
+    elseif rnd_type in ["DBR", "CRD"]
+        vcat(map([:nothing, :center, :region]) do stratified_by  
+            output = @pipe simulated_output |> 
+                groupby(_, [:sim, :design]) |> 
+                combine(_, :trt => abs_imb_fcn => :imb)
+            
+            insertcols!(
+                output, 
+                :imb, 
+                :stratified_by => string(stratified_by),
+                :nsbj => n, 
+                after=true
+            )
+        end...)
+    else
+        throw(InappropriateParameterValue())
+    end
+end
+
+
+# function calculates loss over simulations
+function calculate_loss(simulated_output::DataFrame, rnd_type::String)
+    if rnd_type == "MTI"
+        vcat(map([:nothing, :center, :region]) do stratified_by 
+            trt_var = @match stratified_by begin
+                :nothing => :trt_n
+                :center  => :trt_c
+                :region  => :trt_r
+            end
+    
+            design_prefix = @match stratified_by begin
+                :nothing => "U-"
+                :center  => "C-"
+                :region  => "R-"
+            end
+    
+            vcat(map([:nothing, :center, :region]) do stratified_by 
+                output = @pipe simulated_output |> 
+                    groupby(_, [:sim, :design, stratified_by]) |>
+                    combine(_, trt_var => loss_fcn => :value) |>
+                    groupby(_, [:sim, :design]) |> 
+                    combine(_, :value => sum => :loss)
+
+                insertcols!(
+                    output, 
+                    :loss, 
+                    :stratified_by => string(stratified_by),
+                    :nsbj => n, 
+                    after=true
+                )
+
+                transform!(
+                    output, 
+                    :design => (design -> design_prefix .* design) => :design
+                )
+            end...)
+        end...)
+    elseif rnd_type in ["DBR", "CRD"]
+        vcat(map([:nothing, :center, :region]) do stratified_by  
+            output = @pipe simulated_output |> 
+                groupby(_, [:sim, :design, stratified_by]) |> 
+                combine(_, :trt => loss_fcn => :value) |>
+                groupby(_, [:sim, :design]) |> 
+                combine(_, :value => sum => :loss)
+            
+            insertcols!(
+                output, 
+                :loss, 
+                :stratified_by => string(stratified_by),
+                :nsbj => n, 
+                after=true
+            )
+        end...)
+    else
+        throw(InappropriateParameterValue())
+    end
+end
+
+
+# function calculates the expected proportion of centers (among all centers that 
+# recruited at least 2 patients) that resulted in the allocation ratio more skewed 
+# that 1:2 or 2:1 over simulations
+function calculate_p_skewed(simulated_output::DataFrame, rnd_type::String)
+    if rnd_type == "MTI"
+        vcat(map([:nothing, :center, :region]) do stratified_by 
+            trt_var = @match stratified_by begin
+                :nothing => :trt_n
+                :center  => :trt_c
+                :region  => :trt_r
+            end
+    
+            design_prefix = @match stratified_by begin
+                :nothing => "U-"
+                :center  => "C-"
+                :region  => "R-"
+            end
+    
+            output = @pipe simulated_output |> 
+                groupby(_, [:sim, :design, :center]) |>
+                combine(_, 
+                    :sbj => length => :n, 
+                    trt_var => abs_imb_fcn => :imb
+                ) |>
+                filter(:n => (x -> x .>= 2), _) |> 
+                transform(_, [:n, :imb] => ((n, D) -> D ./ n) => :r) |>
+                transform(_, :r => (x -> Int.(x .> 1/3)) => :skewed) |>
+                groupby(_, [:design, :sim]) |>
+                combine(_, :skewed => mean => :mean_skewed) |>
+                groupby(_, :design) |>
+                combine(_, :mean_skewed => mean => :p_skewed)
+
+                transform!(
+                    output, 
+                    :design => (design -> design_prefix .* design) => :design
+            )
+        end...)
+    elseif rnd_type in ["DBR", "CRD"]
+        output = @pipe simulated_output |> 
+                groupby(_, [:sim, :design, :center]) |>
+                combine(_, 
+                    :sbj => length => :n, 
+                    :trt => abs_imb_fcn => :imb
+                ) |>
+                filter(:n => (x -> x .>= 2), _) |> 
+                transform(_, [:n, :imb] => ((n, D) -> D ./ n) => :r) |>
+                transform(_, :r => (x -> Int.(x .> 1/3)) => :skewed) |>
+                groupby(_, [:design, :sim]) |>
+                combine(_, :skewed => mean => :mean_skewed) |>
+                groupby(_, :design) |>
+                combine(_, :mean_skewed => mean => :p_skewed)
+    else
+        throw(InappropriateParameterValue())
+    end
+end
+
+# setting file name to save the output
+imb_file = "./output/scenario0$(scenario)/output02a-imb";
+loss_file = "./output/scenario0$(scenario)/output02b-loss";
+p_skewed_file = "./output/scenario0$(scenario)/output02c-p-skewed"
+
+# calculating absolute imbalance
+@time imb = vcat(
+    [calculate_abs_imb(o, t) for (o, t) in zip(simulated_output, rnd_type)]...
+);
+
+# calculating loss
+@time loss = vcat(
+    [calculate_loss(o, t) for (o, t) in zip(simulated_output, rnd_type)]...
+);
+
+# calculating loss
+@time p_skewed = vcat(
+    [calculate_p_skewed(o, t) for (o, t) in zip(simulated_output, rnd_type)]...
+);
+
+# saving data
+CSV.write(imb_file * ".csv", imb);
+CSV.write(loss_file * ".csv", loss);
+CSV.write(p_skewed_file * ".csv", p_skewed);
+
+# visualizing simulated data
+_levels = ["nothing", "region", "center"];
+_labels = ["Trial level", "Region level", "Center level"];
+
+simulated_loss = @pipe loss |>
+    transform(_, :design => categorize => :design) |>
+    transform(_, :stratified_by => (x -> categorize(x, _levels, _labels)) => :stratified_by) |>
+    transform(_, [:loss, :nsbj] => ((L, n) -> 1 .- L./n) => :RE);
+
+function make_boxplot(simulated_op::DataFrame, variable::Symbol)
+    @df simulated_op Plots.boxplot(
+        :design,
+        cols(variable), 
+        group = :stratified_by,
+        legend = false, 
+        title = permutedims(_labels),
+        color = :blue4,
+        alpha = 0.5,
+        layout = (3, 1),
+        xrotation = 45,
+        size = (800, 600),
+        dpi = 300
+    )
+end    
+
+figure02a = make_boxplot(simulated_loss, :loss);
+figure02b = make_boxplot(simulated_loss, :RE);
+
+# saving plots
+png(figure02a, imb_file * "-loss");  
+png(figure02b, imb_file * "-RE");  
+```
+
+
+```{julia}
+#| label: fig-simulated-loss
+#| fig-cap: Boxplots of the simulated loss.
+
+# showing loss plot
+figure02a
+```
+
+```{julia}
+#| label: fig-simulated-re
+#| fig-cap: Boxplots of the simulated Relative efficiency.
+
+# showing RE plot
+figure02b
+```
+
+```{julia}
+#| label: tbl-simulated-std-of-imb
+#| tbl-cap: Standard deviation of absolute imbalance.
+
+# table of SD(|D|)
+@pipe imb |> 
+    groupby(_, :design) |> 
+    combine(_, :imb => std => :SD_imb)
+```
+
+
+```{julia}
+#| label: tbl-simulated-p-skewed
+#| tbl-cap: The expected proportion of centers (among all centers that recruited at least 2 patients) that resulted in the allocation ratio more skewed that 1:2 or 2:1.
+
+# table of Pskewed
+p_skewed
+```
+
+One also may conisder another measures of imbalance such as 
+
+$$
+\Pr(|D(n)| \geq d), \: d = 0, 1, \ldots .
+$$
+
+The following code calculates such a characteristic.
+
+
+```{julia}
+#| label: fig-prb-of-imb
+#| fig-cap: Probability of absolute imbalance. 
+
+# function that calculates Pr(|imb| >= d), given simulations' output
+function calculate_prb_of_imb(simulated_output::DataFrame, d::Vector{Int64}, rnd_type::String)
+    if rnd_type == "MTI"
+        vcat(map([:nothing, :center, :region]) do stratified_by 
+            trt_var = @match stratified_by begin
+                :nothing => :trt_n
+                :center  => :trt_c
+                :region  => :trt_r
+            end
+            
+            design_prefix = @match stratified_by begin
+                :nothing => "U-"
+                :center  => "C-"
+                :region  => "R-"
+            end
+        
+            vcat(map([:nothing, :center, :region]) do stratified_by 
+                imb = @pipe simulated_output |> 
+                    groupby(_, [:sim, :design, stratified_by]) |> 
+                    combine(_, trt_var => imb_fcn => :imb) |>
+                    groupby(_, [:sim, :design]) |>
+                    combine(_, :imb => maximum => :D) 
+                
+                for value in d
+                    transform!(imb, :D => (D -> Int.(D .>= value)) => Symbol("Pr_d_", value))
+                end    
+                insertcols!(imb, :design, :stratified_by => string(stratified_by), after=true)
+                transform!(imb, :design => (design -> design_prefix .* design) => :design)
+            end...)  
+        end...)
+    elseif rnd_type in ["DBR", "CRD"]
+        vcat(map([:nothing, :center, :region]) do stratified_by 
+            imb = @pipe simulated_output |> 
+                groupby(_, [:sim, :design, stratified_by]) |> 
+                combine(_, :trt => imb_fcn => :imb) |>
+                groupby(_, [:sim, :design]) |>
+                combine(_, :imb => maximum => :D) 
+            
+            for value in d
+                transform!(imb, :D => (D -> Int.(D .>= value)) => Symbol("Pr_d_", value))
+            end    
+            insertcols!(imb, :design, :stratified_by => string(stratified_by), after=true)  
+        end...)    
+    else
+        throw(InappropriateParameterValue())
+    end
+end 
+
+# setting file name to save the output
+prb_of_imb_file = "./output/scenario0$(scenario)/output03-prb-of-imb";
+
+# calculating Pr(|D| >= d)
+d = collect(0:10)
+@time prb_of_imb = vcat(
+    [calculate_prb_of_imb(o, d, t) for (o, t) in zip(simulated_output, rnd_type)]...);
+
+# saving data
+CSV.write(prb_of_imb_file * ".csv", prb_of_imb);
+
+# visualizing simulated data
+_levels = ["nothing", "region", "center"];
+_labels = ["Trial level", "Region level", "Center level"];
+
+function extract_int(x) 
+    [parse(Int64, match.(r"(\d+)", x[i]).captures[1]) for i in eachindex(x)]
+end;
+
+simulated_prb_of_imb = @pipe prb_of_imb |>
+    select(_, Not([:sim, :D])) |>
+    groupby(_, [:design, :stratified_by]) |>
+    combine(_, valuecols(_) .=> mean) |>
+    DataFrames.stack(_, 
+        Not([:design, :stratified_by]), 
+        variable_name = :d,
+        value_name = :probability
+    ) |>
+    transform(_, :d => extract_int => :d) |>
+    transform(_, :design => categorize => :design) |>
+    transform(_, :stratified_by => (x -> categorize(x, _levels, _labels)) => :stratified_by);
+
+_title = levels(simulated_prb_of_imb.design);
+_xlabel = repeat(["", "", "", L"d"], inner = 4);
+_ylabel = repeat([L"\Pr(|D|\geq d)", "", "", ""], outer = 4);
+
+prb_of_imb_plots = @df simulated_prb_of_imb plot(
+    :d,
+    :probability,
+    group = (:stratified_by, :design),
+    layout = (4, 4),
+    legend = false,
+    color = [:green :orange :navyblue],
+    lw = 1.5, 
+    markershape = [:circle :rect :utriangle],
+    markersize = 4,
+    xlims = (-0.1, 11),
+    xticks = ((0:2:10)),
+    ylims = (-0.1, 1.1),
+    yticks = ((0:0.25:1)),
+    tickfontsize = 10,
+    labelfontsize = 12,
+    titlefontsize = 12,
+    size = (800, 600),
+    dpi = 300,
+    xlabel = permutedims(_xlabel),
+    ylabel = permutedims(_ylabel),
+    title = permutedims(_title)
+); 
+
+# adding legend outside the plot
+l = @layout [
+    grid(1, 1) 
+    a{0.01h}  
+]
+prb_of_imb_plots = plot(prb_of_imb_plots,
+    scatter(
+        (1:3)', 
+        label = ["Trial level" "Region level" "Center level"], 
+        color = [:green :orange :navyblue],
+        markershape = [:circle :rect :utriangle],
+        xlim = (2, 6), 
+        legend = :left, 
+        framestyle = :none
+    ),
+    layout = l
+);
+
+# saving plot
+png(prb_of_imb_plots, prb_of_imb_file);
+
+# showing plot
+prb_of_imb_plots
+```
+
+### Randomness
+
+For quantifying lack of randomness in the study, we consider the following metrics:
+
+- _**Expected proportion of deterministic assignments**_ in the sequence:
+
+$$
+    PD=\frac{1}{n}\sum\limits_{j=1}^n\Pr(\phi_j = 1 \text{ or }0).
+$$
+
+- _**Expected proportion of non-random assignments in the sequence**_:
+
+$$
+    PNR = 1 - \frac{1}{n}\sum\limits_{j=1}^n\Pr(\phi_j = 0.5).
+$$
+
+- _**Proportion of correct guesses**_ assuming that the investigator (at the site level) uses the convergence guessing strategy: _guess next treatment assignments as $E$ (or $C$), if the current number of allocations to $E$ in the given site is less than (or greater than) the number of allocations to $C$; otherwise make a random guess (with probability 0.5). Therefore, we have:
+
+$$
+    PCG=\frac{1}{n}\sum\limits_{j=1}^n\Pr(G_j = 1),
+$$
+
+where $G_j=1 (\text{or }0)$, if the $j^\text{th}$ patient's treatment assignment is guessed correctly (or incorrectly).
+
+- _**Forcing index**_, measuring the overall deviation from the conditional randomization probability ($\phi_j$) and the unconditional value (0.5):
+$$
+    FI=\frac{1}{n}\sum\limits_{j=1}^n\frac{\mathbf{E}|\phi_j- 0.5|}{0.5}.
+$$
+
+```{julia}
+#| label: fig-randomness
+#| fig-cap: Randomness characteristics.
+
+# function calculates correct guesses under the convergence guessing strategy (CGC), 
+# given a sequence of treatment assignments
+function cgc_fcn(trt)
+    # sample size
+    nsbj = length(trt);                               
+
+    # imbalance before the next allocation step
+    imb = 2*cumsum([0; trt[1:end-1]]) .- (0:nsbj-1); 
+
+    # guessing trt
+    guess = [D == 0 ? Int(rand(Bernoulli())) : (D < 0 ? 1 : 0) for D in imb]; 
+
+    # correct guesses
+    correct = Int.(guess .== trt);
+
+    return correct                                    
+end
+
+
+# function calculates correct guesses under the deterministic guessing strategy 
+# (CGD), given sequences of treatment assignments and corresponding allocation probabilities
+function cgd_fcn(trt, b)
+    # sample size
+    nsbj = length(trt);                               
+
+    # imbalance before the next allocation step
+    imb = 2*cumsum([0; trt[1:end-1]]) .- (0:nsbj-1); 
+
+    # guessing trt
+    guess = [abs(D) == b ? (D == -b ? 1 : 0) : Int(rand(Bernoulli())) for D in imb]; 
+
+    # correct guesses
+    correct = Int.(guess .== trt);
+
+    return correct  
+end
+
+# function calculates proportion of deterministic (PD) assignments, 
+# given a sequence of allocation probabilities
+function pd_fcn(prb)
+    # deterministic assignments: an assignment j is deterministic, if P(trt[j] = 1) in [0, 1]
+    D = [Int(p == 0 || p ==1) for p in prb] 
+
+    # proportion of deterministic assignments
+    return mean(D)                          
+end
+
+
+# function calculates proportion of non-random (PNR) assignments, 
+# given a sequence of allocation probabilities
+function pnr_fcn(prb)
+    # non-random assignments: an assignment j is non-random, if P(trt[j] = 1) ≠ 0.5
+    NR = [1 - Int(p == 0.5) for p in prb] 
+
+    # proportion of non-random assignments
+    return mean(NR)                       
+end
+
+
+# function calculates forcing index (FI), 
+# given a sequence of allocation probabilities
+function fi_fcn(prb)
+    fi = [abs(p - 0.5)/0.5 for p in prb]
+    
+    # forcing index
+    return mean(fi)                         
+end
+
+
+# calculating proportion of correct guesses under the convergence guessing strategy (PCGC) 
+# through simulations
+function calculate_pcgc(simulated_output::DataFrame, rnd_type::String)
+    if rnd_type == "MTI"
+        vcat(map([:nothing, :center, :region]) do stratified_by 
+            trt_var = @match stratified_by  begin
+                :nothing => :trt_n
+                :center  => :trt_c
+                :region  => :trt_r
+            end
+                        
+            design_prefix = @match stratified_by  begin
+                :nothing => "U-"
+                :center  => "C-"
+                :region  => "R-"
+            end
+        
+            @pipe simulated_output |>
+                groupby(_, [:sim, :design, :center]) |>
+                transform(_, trt_var => cgc_fcn => :CGC) |>
+                groupby(_, [:sim, :design]) |>
+                combine(_, :CGC => mean => :PCGC) |>
+                transform(_, :design => (design -> design_prefix .* design) => :design)
+        end...)
+    elseif rnd_type in ["DBR", "CRD"]
+        @pipe simulated_output |>
+            groupby(_, [:sim, :design, :center]) |>
+            transform(_, :trt => cgc_fcn => :CGC) |>
+            groupby(_, [:sim, :design]) |>
+            combine(_, :CGC => mean => :PCGC) 
+    else
+        throw(InappropriateParameterValue())
+    end
+end
+
+
+# calculating proportion of correct guesses under the deterministic guessing strategy (PCGC) 
+# through simulations
+function calculate_pcgd(simulated_output::DataFrame, b::Int64, rnd_type::String)
+        if rnd_type == "MTI"
+        vcat(map([:nothing, :center, :region]) do stratified_by 
+            trt_var = @match stratified_by  begin
+                :nothing => :trt_n
+                :center  => :trt_c
+                :region  => :trt_r
+            end
+                        
+            design_prefix = @match stratified_by  begin
+                :nothing => "U-"
+                :center  => "C-"
+                :region  => "R-"
+            end
+        
+            @pipe simulated_output |>
+                groupby(_, [:sim, :design, :center]) |>
+                transform(_, trt_var => (t -> cgd_fcn(t, b)) => :CGD) |>
+                groupby(_, [:sim, :design]) |>
+                combine(_, :CGD => mean => :PCGD) |>
+                transform(_, :design => (design -> design_prefix .* design) => :design)
+        end...)
+    elseif rnd_type in ["DBR", "CRD"]
+        @pipe simulated_output |>
+            groupby(_, [:sim, :design, :center]) |>
+            transform(_, :trt => (t -> cgd_fcn(t, b)) => :CGD) |>
+            groupby(_, [:sim, :design]) |>
+            combine(_, :CGD => mean => :PCGD) 
+    else
+        throw(InappropriateParameterValue())
+    end
+end
+
+# calculating proportion of deterministic (PD), non-random (PNR) assignments, 
+# and forcing index (FI) over simulations
+function calculate_pd_pnr_fi(simulated_output::DataFrame, rnd_type::String)
+    if rnd_type == "MTI"
+        vcat(map([:nothing, :center, :region]) do stratified_by             
+            prb_var = @match stratified_by  begin
+                :nothing => :prb_n
+                :center  => :prb_c
+                :region  => :prb_r
+            end
+            
+            design_prefix = @match stratified_by  begin
+                :nothing => "U-"
+                :center  => "C-"
+                :region  => "R-"
+            end
+        
+            @pipe simulated_output |> 
+                groupby(_, [:sim, :design]) |> 
+                combine(_, 
+                    prb_var => pd_fcn => :PD, 
+                    prb_var => pnr_fcn => :PNR,
+                    prb_var => fi_fcn => :FI
+                ) |> 
+                transform(_, :design => (design -> design_prefix .* design) => :design)
+        end...)
+    elseif rnd_type in ["DBR", "CRD"]
+        @pipe simulated_output |> 
+            groupby(_, [:sim, :design]) |> 
+            combine(_, 
+                :prb => pd_fcn => :PD, 
+                :prb => pnr_fcn => :PNR,
+                :prb => fi_fcn => :FI
+            )
+    else
+        throw(InappropriateParameterValue())
+    end
+end
+
+# setting file name to save the output
+randomness_file = "./output/scenario0$(scenario)/output04-randomness";
+
+# randomness characteristics: PCGC, PCGD, PD, PNR, and FI
+@time pcgc = vcat([calculate_pcgc(o, t) for (o, t) in zip(simulated_output, rnd_type)]...);
+@time pcgd = vcat([calculate_pcgd(o, b, t) for (o, t) in zip(simulated_output, rnd_type)]...);
+@time pd_pnr_fi = vcat([calculate_pd_pnr_fi(o, t) for (o, t) in zip(simulated_output, rnd_type)]...);
+randomness = innerjoin(
+    innerjoin(pcgc, pcgd, on = [:sim, :design]), 
+    pd_pnr_fi, 
+    on = [:sim, :design]
+);
+
+# saving data
+CSV.write(randomness_file * ".csv", randomness);
+
+# visualizing simulated data
+simulated_rand = @pipe randomness |>
+    select(_, :design, :PD, :PCGC, :PCGD) |>
+    DataFrames.stack(_, Not(:design), variable_name = :op) |>
+    transform(_, :design => categorize => :design) |>
+    transform(_, :op => categorize => :op) |>
+    groupby(_, [:design, :op]) |>
+    combine(_, :value => mean => :value, ungroup = true) |>
+    transform(_, :value => (n -> round.(n, digits = 2)) => :value_r);
+
+
+_title = [
+    "Expected proportion of deterministic assignments (PD)", 
+    "Expected proportion of correct guesses\nunder convergence guessing strategy (PCGC)",
+    "Expected proportion of correct guesses\nunder deterministic guessing strategy (PCGD)",
+];
+
+@df simulated_rand bar(
+    :design,
+    :value .+ 0.08,
+    group = :op,
+    legend = false, 
+    color = :navyblue,
+    alpha = 0.0,
+    layout = (3, 1),
+    ylims = (0, 1),
+    xrotation = 45,
+    texts = simulated_rand.value_r,
+    bottom_margin=5*Plots.mm,
+    size = (800, 600),
+    dpi = 300
+);   
+
+randomness_barplot = @df simulated_rand bar!(
+    :design,
+    :value,
+    group = :op,
+    legend = false, 
+    title = permutedims(_title),
+    color = :navyblue,
+    alpha = 0.5,
+    layout = (3, 1),
+    ylims = (0, 1),
+    xrotation = 45,
+    bottom_margin=5*Plots.mm,
+    size = (800, 600),
+    dpi = 300
+);    
+
+# saving plot
+png(randomness_barplot, randomness_file);
+
+# showing plot
+randomness_barplot
+```
